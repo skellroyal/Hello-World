@@ -1,0 +1,246 @@
+From patchwork Thu Feb 11 16:37:10 2016
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Subject: [dpdk-dev,v3] af_packet: make the device detachable
+From: Wojciech Zmuda <woz@semihalf.com>
+X-Patchwork-Id: 10470
+Message-Id: <1455208630-21710-1-git-send-email-woz@semihalf.com>
+To: dev@dpdk.org
+Date: Thu, 11 Feb 2016 17:37:10 +0100
+
+Allow dynamic deallocation of af_packet device through proper
+API functions. To achieve this:
+* set device flag to RTE_ETH_DEV_DETACHABLE
+* implement rte_pmd_af_packet_devuninit() and expose it
+  through rte_driver.uninit()
+* copy device name to ethdev->data to make discoverable with
+  rte_eth_dev_allocated()
+Moreover, make af_packet init function static, as there is no
+reason to keep it public.
+
+Signed-off-by: Wojciech Zmuda <woz@semihalf.com>
+
+---
+v3:
+* Rephrased feature note in release notes.
+* Rephrased commit log.
+* Added API change note in release notes.
+* Made init function static.
+* Removed af_packet header file, as it is not needed
+  after init function is not public anymore.
+
+v2:
+* Fixed typo and a comment.
+* Added feature to the 2.3 release notes.
+* Free memory allocated for rx and tx queues.
+
+ doc/guides/rel_notes/release_2_3.rst               |  6 +++
+ drivers/net/af_packet/Makefile                     |  5 --
+ drivers/net/af_packet/rte_eth_af_packet.c          | 43 ++++++++++++++++--
+ drivers/net/af_packet/rte_eth_af_packet.h          | 53 ----------------------
+ .../net/af_packet/rte_pmd_af_packet_version.map    |  3 --
+ 5 files changed, 45 insertions(+), 65 deletions(-)
+ delete mode 100644 drivers/net/af_packet/rte_eth_af_packet.h
+
+diff --git a/doc/guides/rel_notes/release_2_3.rst b/doc/guides/rel_notes/release_2_3.rst
+index 7945694..da4abc3 100644
+--- a/doc/guides/rel_notes/release_2_3.rst
++++ b/doc/guides/rel_notes/release_2_3.rst
+@@ -39,6 +39,9 @@ This section should contain new features added in this release. Sample format:
+ 
+   Enabled virtio 1.0 support for virtio pmd driver.
+ 
++* **Added af_packet dynamic removal function.**
++
++  Af_packet device can now be detached using API, like other PMD devices.
+ 
+ Resolved Issues
+ ---------------
+@@ -91,6 +94,9 @@ This section should contain API changes. Sample format:
+ * Add a short 1-2 sentence description of the API change. Use fixed width
+   quotes for ``rte_function_names`` or ``rte_struct_names``. Use the past tense.
+ 
++* Af_packet device init function is no longer public. Device should be attached
++  with API.
++
+ 
+ ABI Changes
+ -----------
+diff --git a/drivers/net/af_packet/Makefile b/drivers/net/af_packet/Makefile
+index ce5d239..cb1a7ae 100644
+--- a/drivers/net/af_packet/Makefile
++++ b/drivers/net/af_packet/Makefile
+@@ -50,11 +50,6 @@ CFLAGS += $(WERROR_FLAGS)
+ #
+ SRCS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += rte_eth_af_packet.c
+ 
+-#
+-# Export include files
+-#
+-SYMLINK-y-include += rte_eth_af_packet.h
+-
+ # this lib depends upon:
+ DEPDIRS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += lib/librte_mbuf
+ DEPDIRS-$(CONFIG_RTE_LIBRTE_PMD_AF_PACKET) += lib/librte_ether
+diff --git a/drivers/net/af_packet/rte_eth_af_packet.c b/drivers/net/af_packet/rte_eth_af_packet.c
+index 767f36b..5544528 100644
+--- a/drivers/net/af_packet/rte_eth_af_packet.c
++++ b/drivers/net/af_packet/rte_eth_af_packet.c
+@@ -53,8 +53,6 @@
+ #include <unistd.h>
+ #include <poll.h>
+ 
+-#include "rte_eth_af_packet.h"
+-
+ #define ETH_AF_PACKET_IFACE_ARG		"iface"
+ #define ETH_AF_PACKET_NUM_Q_ARG		"qpairs"
+ #define ETH_AF_PACKET_BLOCKSIZE_ARG	"blocksz"
+@@ -65,6 +63,8 @@
+ #define DFLT_FRAME_SIZE		(1 << 11)
+ #define DFLT_FRAME_COUNT	(1 << 9)
+ 
++#define RTE_PMD_AF_PACKET_MAX_RINGS 16
++
+ struct pkt_rx_queue {
+ 	int sockfd;
+ 
+@@ -667,11 +667,13 @@ rte_pmd_init_internals(const char *name,
+ 	data->nb_tx_queues = (uint16_t)nb_queues;
+ 	data->dev_link = pmd_link;
+ 	data->mac_addrs = &(*internals)->eth_addr;
++	strncpy(data->name,
++		(*eth_dev)->data->name, strlen((*eth_dev)->data->name));
+ 
+ 	(*eth_dev)->data = data;
+ 	(*eth_dev)->dev_ops = &ops;
+ 	(*eth_dev)->driver = NULL;
+-	(*eth_dev)->data->dev_flags = 0;
++	(*eth_dev)->data->dev_flags = RTE_ETH_DEV_DETACHABLE;
+ 	(*eth_dev)->data->drv_name = drivername;
+ 	(*eth_dev)->data->kdrv = RTE_KDRV_NONE;
+ 	(*eth_dev)->data->numa_node = numa_node;
+@@ -798,7 +800,7 @@ rte_eth_from_packet(const char *name,
+ 	return 0;
+ }
+ 
+-int
++static int
+ rte_pmd_af_packet_devinit(const char *name, const char *params)
+ {
+ 	unsigned numa_node;
+@@ -836,10 +838,43 @@ exit:
+ 	return ret;
+ }
+ 
++static int
++rte_pmd_af_packet_devuninit(const char *name)
++{
++	struct rte_eth_dev *eth_dev = NULL;
++	struct pmd_internals *internals;
++	unsigned q;
++
++	RTE_LOG(INFO, PMD, "Closing AF_PACKET ethdev on numa socket %u\n",
++			rte_socket_id());
++
++	if (name == NULL)
++		return -1;
++
++	/* find the ethdev entry */
++	eth_dev = rte_eth_dev_allocated(name);
++	if (eth_dev == NULL)
++		return -1;
++
++	internals = eth_dev->data->dev_private;
++	for (q = 0; q < internals->nb_queues; q++) {
++		rte_free(internals->rx_queue[q].rd);
++		rte_free(internals->tx_queue[q].rd);
++	}
++
++	rte_free(eth_dev->data->dev_private);
++	rte_free(eth_dev->data);
++
++	rte_eth_dev_release_port(eth_dev);
++
++	return 0;
++}
++
+ static struct rte_driver pmd_af_packet_drv = {
+ 	.name = "eth_af_packet",
+ 	.type = PMD_VDEV,
+ 	.init = rte_pmd_af_packet_devinit,
++	.uninit = rte_pmd_af_packet_devuninit,
+ };
+ 
+ PMD_REGISTER_DRIVER(pmd_af_packet_drv);
+diff --git a/drivers/net/af_packet/rte_eth_af_packet.h b/drivers/net/af_packet/rte_eth_af_packet.h
+deleted file mode 100644
+index 5d1bc7e..0000000
+--- a/drivers/net/af_packet/rte_eth_af_packet.h
++++ /dev/null
+@@ -1,53 +0,0 @@
+-/*-
+- *   BSD LICENSE
+- *
+- *   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
+- *   All rights reserved.
+- *
+- *   Redistribution and use in source and binary forms, with or without
+- *   modification, are permitted provided that the following conditions
+- *   are met:
+- *
+- *     * Redistributions of source code must retain the above copyright
+- *       notice, this list of conditions and the following disclaimer.
+- *     * Redistributions in binary form must reproduce the above copyright
+- *       notice, this list of conditions and the following disclaimer in
+- *       the documentation and/or other materials provided with the
+- *       distribution.
+- *     * Neither the name of Intel Corporation nor the names of its
+- *       contributors may be used to endorse or promote products derived
+- *       from this software without specific prior written permission.
+- *
+- *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+- *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+- *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+- *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+- *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+- *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+- *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+- *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+- *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+- *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+- *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+- */
+-
+-#ifndef _RTE_ETH_AF_PACKET_H_
+-#define _RTE_ETH_AF_PACKET_H_
+-
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-
+-#define RTE_PMD_AF_PACKET_MAX_RINGS 16
+-
+-/**
+- * For use by the EAL only. Called as part of EAL init to set up any dummy NICs
+- * configured on command line.
+- */
+-int rte_pmd_af_packet_devinit(const char *name, const char *params);
+-
+-#ifdef __cplusplus
+-}
+-#endif
+-
+-#endif
+diff --git a/drivers/net/af_packet/rte_pmd_af_packet_version.map b/drivers/net/af_packet/rte_pmd_af_packet_version.map
+index de95169..ef35398 100644
+--- a/drivers/net/af_packet/rte_pmd_af_packet_version.map
++++ b/drivers/net/af_packet/rte_pmd_af_packet_version.map
+@@ -1,7 +1,4 @@
+ DPDK_2.0 {
+-	global:
+-
+-	rte_pmd_af_packet_devinit;
+ 
+ 	local: *;
+ };
